@@ -19,7 +19,9 @@ wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1
 2. Compile and run the program
 
 ```
-cargo r -r --model <path to ggml.bin>
+cargo r -r --model <path to ggml.bin> --key KEY_RIGHTSHIFT
 ```
 
-3. Press Right Alt to dictate
+For a list of supported key names, see [docs.rs](https://docs.rs/evdev/0.12.2/evdev/struct.Key.html).
+
+3. Press to dictate
