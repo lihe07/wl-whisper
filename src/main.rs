@@ -91,7 +91,7 @@ fn main() -> Result<()> {
         device.name().unwrap_or_else(|_| "?".into()),
         sample_rate
     );
-    eprintln!("Hold Right Alt to record. Ctrl+C to quit.\n");
+    eprintln!("Hold {} to record. Ctrl+C to quit.\n", args.key);
 
     loop {
         match key_rx.recv() {
