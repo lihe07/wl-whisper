@@ -33,15 +33,16 @@ fn main() -> Result<()> {
         WhisperContext::new_with_params(&args.model, ctx_params).context("Failed to load model")?;
     eprintln!("Model ready.");
 
-    let keyboards = find_keyboards();
-    if keyboards.is_empty() {
-        return Err(anyhow!(
-            "No keyboard found in /dev/input. Are you in the 'input' group?\n  sudo usermod -aG input $USER"
-        ));
-    }
-
     let key_trigger = Key::from_str(&args.key)
         .map_err(|_| anyhow!("Invalid key {}! For a list of supported key names, see https://docs.rs/evdev/0.12.2/evdev/struct.Key.html", args.key))?;
+
+    let keyboards = find_keyboards(key_trigger);
+    if keyboards.is_empty() {
+        return Err(anyhow!(
+            "No device found that supports {}. Check /dev/input permissions or try a different key.",
+            args.key
+        ));
+    }
 
     let (key_tx, key_rx) = mpsc::channel::<bool>();
     for mut kb in keyboards {
@@ -127,11 +128,14 @@ fn main() -> Result<()> {
         if raw.is_empty() {
             continue;
         }
+        // Skip too-short samples
+        let duration = raw.len() as f32 / sample_rate as f32;
+        if duration < 0.5 {
+            eprintln!("[Audio too short! {:.1}s]", duration);
+            continue;
+        }
 
-        eprintln!(
-            "[Transcribing {:.1}s…]",
-            raw.len() as f32 / sample_rate as f32
-        );
+        eprintln!("[Transcribing {:.1}s]", duration);
         let audio = if sample_rate != WHISPER_SAMPLE_RATE {
             resample(&raw, sample_rate, WHISPER_SAMPLE_RATE)?
         } else {
@@ -153,11 +157,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn find_keyboards() -> Vec<Device> {
+fn find_keyboards(trigger: Key) -> Vec<Device> {
     evdev::enumerate()
         .filter_map(|(_, dev)| {
             dev.supported_keys()
-                .map_or(false, |k| k.contains(Key::KEY_RIGHTALT))
+                .map_or(false, |k| k.contains(trigger))
                 .then_some(dev)
         })
         .collect()
