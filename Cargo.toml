@@ -1,0 +1,17 @@
+[package]
+name = "wl-whisper"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "wl-whisper"
+path = "src/main.rs"
+
+[dependencies]
+# whisper.cpp bindings — hipblas enables AMD ROCm/HIP GPU acceleration
+whisper-rs = { git = "https://codeberg.org/tazz4843/whisper-rs", features = ["hipblas"] }
+cpal = "0.15"
+rubato = "0.15"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+evdev = "0.12"
