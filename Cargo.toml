@@ -8,8 +8,8 @@ name = "wl-whisper"
 path = "src/main.rs"
 
 [dependencies]
-# whisper.cpp bindings — hipblas enables AMD ROCm/HIP GPU acceleration
-whisper-rs = { git = "https://codeberg.org/tazz4843/whisper-rs", features = ["hipblas"] }
+# sherpa-onnx runs NVIDIA Parakeet via ONNX Runtime
+sherpa-onnx = "2.0.1"
 cpal = "0.15"
 rubato = "0.15"
 anyhow = "1"

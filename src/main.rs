@@ -2,22 +2,23 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use evdev::{Device, InputEventKind, Key};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-const WHISPER_SAMPLE_RATE: u32 = 16_000;
+const SAMPLE_RATE: u32 = 16_000;
 
 #[derive(Parser)]
 #[command(about = "Hold key to record, release to transcribe and insert text")]
 struct Args {
+    /// Directory with the Parakeet ONNX files (encoder, decoder, joiner, tokens.txt)
     #[arg(short, long)]
-    model: String,
-    #[arg(short, long, default_value = "auto")]
-    language: String,
-    #[arg(long, default_value = "0")]
-    gpu: i32,
+    model: PathBuf,
+    /// Number of CPU threads used for inference
+    #[arg(short, long, default_value = "4")]
+    threads: i32,
     #[arg(short, long, default_value = "KEY_RIGHTSHIFT")]
     key: String,
 }
@@ -25,12 +26,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("Loading model: {}", args.model);
-    let mut ctx_params = WhisperContextParameters::default();
-    ctx_params.use_gpu(true);
-    ctx_params.gpu_device = args.gpu;
-    let ctx =
-        WhisperContext::new_with_params(&args.model, ctx_params).context("Failed to load model")?;
+    eprintln!("Loading model: {}", args.model.display());
+    let recognizer = load_model(&args.model, args.threads)?;
     eprintln!("Model ready.");
 
     let key_trigger = Key::from_str(&args.key)
@@ -136,13 +133,13 @@ fn main() -> Result<()> {
         }
 
         eprintln!("[Transcribing {:.1}s]", duration);
-        let audio = if sample_rate != WHISPER_SAMPLE_RATE {
-            resample(&raw, sample_rate, WHISPER_SAMPLE_RATE)?
+        let audio = if sample_rate != SAMPLE_RATE {
+            resample(&raw, sample_rate, SAMPLE_RATE)?
         } else {
             raw
         };
 
-        match transcribe(&ctx, &audio, &args.language) {
+        match transcribe(&recognizer, &audio) {
             Ok(text) if !text.is_empty() => {
                 if let Err(e) = std::process::Command::new("wtype").arg(&text).status() {
                     eprintln!("wtype failed: {e}");
@@ -254,35 +251,46 @@ fn resample(input: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-fn transcribe(ctx: &WhisperContext, audio: &[f32], language: &str) -> Result<String> {
-    let mut state = ctx.create_state().context("Failed to create state")?;
-    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-        beam_size: 5,
-        patience: 1.0,
-    });
-    params.set_language(if language == "auto" {
-        None
-    } else {
-        Some(language)
-    });
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    state.full(params, audio).context("Inference failed")?;
+fn load_model(dir: &Path, threads: i32) -> Result<OfflineRecognizer> {
+    let mut config = OfflineRecognizerConfig::default();
+    let model = &mut config.model_config;
+    model.transducer.encoder = Some(find_file(dir, "encoder", ".onnx")?);
+    model.transducer.decoder = Some(find_file(dir, "decoder", ".onnx")?);
+    model.transducer.joiner = Some(find_file(dir, "joiner", ".onnx")?);
+    model.tokens = Some(find_file(dir, "tokens", ".txt")?);
+    model.model_type = Some("nemo_transducer".into());
+    model.num_threads = threads;
+    model.provider = Some("cpu".into());
+    config.decoding_method = Some("greedy_search".into());
+    OfflineRecognizer::create(&config).context("Failed to load model")
+}
 
-    let mut result = String::new();
-    for i in 0..state.full_n_segments() {
-        if let Some(seg) = state.get_segment(i) {
-            if let Ok(text) = seg.to_str() {
-                let text = text.trim();
-                if !text.is_empty() {
-                    if !result.is_empty() {
-                        result.push(' ');
-                    }
-                    result.push_str(text);
-                }
-            }
-        }
+/// Find a file in `dir` named `<prefix>*<suffix>`, e.g. `encoder.int8.onnx`.
+fn find_file(dir: &Path, prefix: &str, suffix: &str) -> Result<String> {
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("Cannot read model directory {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(prefix) && n.ends_with(suffix)
+            })
+        })
+        .collect();
+    matches.sort();
+    match matches.as_slice() {
+        [one] => Ok(one.to_string_lossy().into_owned()),
+        [] => Err(anyhow!("No {prefix}*{suffix} in {}", dir.display())),
+        _ => Err(anyhow!(
+            "Multiple {prefix}*{suffix} files in {}: {matches:?}",
+            dir.display()
+        )),
     }
-    Ok(result)
+}
+
+fn transcribe(recognizer: &OfflineRecognizer, audio: &[f32]) -> Result<String> {
+    let stream = recognizer.create_stream();
+    stream.accept_waveform(SAMPLE_RATE as i32, audio);
+    recognizer.decode(&stream);
+    let result = stream.get_result().context("Inference failed")?;
+    Ok(result.text.trim().to_string())
 }

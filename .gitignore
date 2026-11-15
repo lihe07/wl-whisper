@@ -1,3 +1,7 @@
 /target
 # ggml
 *.bin
+
+# models
+sherpa-onnx-*/
+*.tar.bz2
