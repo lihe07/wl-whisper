@@ -2,22 +2,25 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use evdev::{Device, InputEventKind, Key};
-use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::collections::VecDeque;
 use std::sync::mpsc;
+use std::time::Instant;
 use std::thread;
 
 /// Audio kept from before the key press, so the first word is not clipped
 const PREROLL_SECS: f32 = 0.3;
-/// Silence appended on release to flush the final words out of the model
-const TAIL_PADDING_SECS: f32 = 0.6;
+/// Silence appended on release so the last word is not clipped
+const TAIL_PADDING_SECS: f32 = 0.3;
+/// Shorter key presses are ignored
+const MIN_HOLD_SECS: f32 = 0.5;
 
 #[derive(Parser)]
-#[command(about = "Hold key to dictate; text is typed as you speak")]
+#[command(about = "Hold key to record, release to transcribe and insert text")]
 struct Args {
-    /// Directory with the streaming Parakeet ONNX files (encoder, decoder, joiner, tokens.txt)
+    /// Directory with the Parakeet ONNX files (encoder, decoder, joiner, tokens.txt)
     #[arg(short, long)]
     model: PathBuf,
     /// Number of CPU threads used for inference
@@ -103,12 +106,7 @@ fn main() -> Result<()> {
     for event in rx {
         match event {
             Event::Audio(chunk) => match &mut session {
-                Some(s) => {
-                    s.stream.accept_waveform(sample_rate as i32, &chunk);
-                    decode_ready(&recognizer, &s.stream);
-                    let text = current_text(&recognizer, &s.stream);
-                    type_diff(&mut s.typed, &text);
-                }
+                Some(s) => s.audio.extend(chunk),
                 None => {
                     preroll.extend(chunk);
                     let excess = preroll.len().saturating_sub(preroll_len);
@@ -116,28 +114,31 @@ fn main() -> Result<()> {
                 }
             },
             Event::Key(true) if session.is_none() => {
-                let stream = recognizer.create_stream();
-                stream.accept_waveform(sample_rate as i32, preroll.make_contiguous());
-                preroll.clear();
                 session = Some(Session {
-                    stream,
-                    typed: String::new(),
+                    audio: preroll.drain(..).collect(),
+                    started: Instant::now(),
                     notif: show_notification(),
                 });
+                eprintln!("[Recording…]");
             }
             Event::Key(false) => {
                 let Some(mut s) = session.take() else { continue };
                 dismiss_notification(s.notif);
-                let tail = vec![0.0f32; (sample_rate as f32 * TAIL_PADDING_SECS) as usize];
-                s.stream.accept_waveform(sample_rate as i32, &tail);
-                s.stream.input_finished();
-                decode_ready(&recognizer, &s.stream);
-                let text = current_text(&recognizer, &s.stream);
-                type_diff(&mut s.typed, &text);
-                if text.is_empty() {
-                    eprintln!("[No speech detected]");
-                } else {
-                    eprintln!("[Done: {text}]");
+                // Skip taps, e.g. Shift used for a capital letter
+                let held = s.started.elapsed().as_secs_f32();
+                if held < MIN_HOLD_SECS {
+                    continue;
+                }
+                eprintln!("[Transcribing {held:.1}s]");
+                s.audio
+                    .extend(std::iter::repeat_n(0.0, (sample_rate as f32 * TAIL_PADDING_SECS) as usize));
+                match transcribe(&recognizer, sample_rate, &s.audio) {
+                    Ok(text) if !text.is_empty() => {
+                        type_text(&text);
+                        eprintln!("[Done: {text}]");
+                    }
+                    Ok(_) => eprintln!("[No speech detected]"),
+                    Err(e) => eprintln!("[Error: {e}]"),
                 }
             }
             Event::Key(true) => {}
@@ -153,50 +154,27 @@ enum Event {
 }
 
 struct Session {
-    stream: OnlineStream,
-    /// Text already typed into the focused window
-    typed: String,
+    audio: Vec<f32>,
+    started: Instant,
     notif: Option<u32>,
 }
 
-fn decode_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
-    while recognizer.is_ready(stream) {
-        recognizer.decode(stream);
-    }
+fn transcribe(recognizer: &OfflineRecognizer, sample_rate: u32, audio: &[f32]) -> Result<String> {
+    let stream = recognizer.create_stream();
+    stream.accept_waveform(sample_rate as i32, audio);
+    recognizer.decode(&stream);
+    let result = stream.get_result().context("Inference failed")?;
+    Ok(result.text.trim().to_string())
 }
 
-fn current_text(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> String {
-    recognizer
-        .get_result(stream)
-        .map(|r| r.text.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Bring the typed text in line with `target`, backspacing over anything the model revised.
-fn type_diff(typed: &mut String, target: &str) {
-    let common = typed
-        .chars()
-        .zip(target.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let backspaces = typed.chars().count() - common;
-    let addition: String = target.chars().skip(common).collect();
-    if backspaces == 0 && addition.is_empty() {
-        return;
-    }
-    let mut cmd = std::process::Command::new("wtype");
-    // The first key after switching from the physical keyboard can get dropped
-    // while the trigger key is held, so lead with a harmless one.
-    cmd.args(["-k", "Shift_L"]);
-    for _ in 0..backspaces {
-        cmd.args(["-k", "BackSpace"]);
-    }
-    if !addition.is_empty() {
-        cmd.arg(&addition);
-    }
-    match cmd.status() {
-        Ok(_) => *typed = target.to_string(),
-        Err(e) => eprintln!("wtype failed: {e}"),
+fn type_text(text: &str) {
+    // The first key after switching from the physical keyboard can get dropped,
+    // so lead with a harmless one.
+    if let Err(e) = std::process::Command::new("wtype")
+        .args(["-k", "Shift_L", text])
+        .status()
+    {
+        eprintln!("wtype failed: {e}");
     }
 }
 
@@ -279,17 +257,18 @@ fn build_input_stream(
     })
 }
 
-fn load_model(dir: &Path, threads: i32) -> Result<OnlineRecognizer> {
-    let mut config = OnlineRecognizerConfig::default();
+fn load_model(dir: &Path, threads: i32) -> Result<OfflineRecognizer> {
+    let mut config = OfflineRecognizerConfig::default();
     let model = &mut config.model_config;
     model.transducer.encoder = Some(find_file(dir, "encoder", ".onnx")?);
     model.transducer.decoder = Some(find_file(dir, "decoder", ".onnx")?);
     model.transducer.joiner = Some(find_file(dir, "joiner", ".onnx")?);
     model.tokens = Some(find_file(dir, "tokens", ".txt")?);
+    model.model_type = Some("nemo_transducer".into());
     model.num_threads = threads;
     model.provider = Some("cpu".into());
     config.decoding_method = Some("greedy_search".into());
-    OnlineRecognizer::create(&config).context("Failed to load model")
+    OfflineRecognizer::create(&config).context("Failed to load model")
 }
 
 /// Find a file in `dir` named `<prefix>*<suffix>`, e.g. `encoder.int8.onnx`.
