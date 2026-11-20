@@ -26,6 +26,8 @@ cargo r -r -- --model sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-streaming-1
 
 `--model` is the directory containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx` and `tokens.txt`. Use `--threads` to set the number of CPU threads (default 4).
 
+Use a modifier key like `KEY_RIGHTSHIFT` (the default) as the trigger. Text is typed while the key is held, and a non-modifier key would autorepeat into the focused window.
+
 For a list of supported key names, see [docs.rs](https://docs.rs/evdev/0.12.2/evdev/struct.Key.html).
 
 3. Hold the key and speak. Words are typed as they are recognized; release to finish.

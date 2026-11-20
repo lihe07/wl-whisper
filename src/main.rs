@@ -107,9 +107,7 @@ fn main() -> Result<()> {
                     s.stream.accept_waveform(sample_rate as i32, &chunk);
                     decode_ready(&recognizer, &s.stream);
                     let text = current_text(&recognizer, &s.stream);
-                    // Hold back the last word, it may still change.
-                    let settled = text.rfind(' ').map_or("", |i| &text[..i]);
-                    type_diff(&mut s.typed, settled);
+                    type_diff(&mut s.typed, &text);
                 }
                 None => {
                     preroll.extend(chunk);
@@ -187,6 +185,9 @@ fn type_diff(typed: &mut String, target: &str) {
         return;
     }
     let mut cmd = std::process::Command::new("wtype");
+    // The first key after switching from the physical keyboard can get dropped
+    // while the trigger key is held, so lead with a harmless one.
+    cmd.args(["-k", "Shift_L"]);
     for _ in 0..backspaces {
         cmd.args(["-k", "BackSpace"]);
     }
