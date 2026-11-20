@@ -11,7 +11,6 @@ path = "src/main.rs"
 # sherpa-onnx runs NVIDIA Parakeet via ONNX Runtime
 sherpa-onnx = "2.0.1"
 cpal = "0.15"
-rubato = "0.15"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 evdev = "0.12"

@@ -2,18 +2,22 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use evdev::{Device, InputEventKind, Key};
-use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
+use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::collections::VecDeque;
+use std::sync::mpsc;
 use std::thread;
 
-const SAMPLE_RATE: u32 = 16_000;
+/// Audio kept from before the key press, so the first word is not clipped
+const PREROLL_SECS: f32 = 0.3;
+/// Silence appended on release to flush the final words out of the model
+const TAIL_PADDING_SECS: f32 = 0.6;
 
 #[derive(Parser)]
-#[command(about = "Hold key to record, release to transcribe and insert text")]
+#[command(about = "Hold key to dictate; text is typed as you speak")]
 struct Args {
-    /// Directory with the Parakeet ONNX files (encoder, decoder, joiner, tokens.txt)
+    /// Directory with the streaming Parakeet ONNX files (encoder, decoder, joiner, tokens.txt)
     #[arg(short, long)]
     model: PathBuf,
     /// Number of CPU threads used for inference
@@ -41,25 +45,23 @@ fn main() -> Result<()> {
         ));
     }
 
-    let (key_tx, key_rx) = mpsc::channel::<bool>();
+    let (tx, rx) = mpsc::channel::<Event>();
     for mut kb in keyboards {
-        let tx = key_tx.clone();
+        let tx = tx.clone();
         thread::spawn(move || {
             loop {
                 match kb.fetch_events() {
                     Ok(events) => {
                         for ev in events {
-                            if let InputEventKind::Key(key) = ev.kind() {
-                                if key == key_trigger {
-                                    match ev.value() {
-                                        1 => {
-                                            let _ = tx.send(true);
-                                        }
-                                        0 => {
-                                            let _ = tx.send(false);
-                                        }
-                                        _ => {}
+                            if ev.kind() == InputEventKind::Key(key_trigger) {
+                                match ev.value() {
+                                    1 => {
+                                        let _ = tx.send(Event::Key(true));
                                     }
+                                    0 => {
+                                        let _ = tx.send(Event::Key(false));
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -72,7 +74,6 @@ fn main() -> Result<()> {
             }
         });
     }
-    drop(key_tx);
 
     let host = cpal::default_host();
     let device = host
@@ -84,74 +85,118 @@ fn main() -> Result<()> {
     let sample_format = supported.sample_format();
     let stream_config: cpal::StreamConfig = supported.into();
 
+    // The mic stays open so recording starts instantly on key press.
+    let mic = build_input_stream(&device, &stream_config, sample_format, tx, channels)?;
+    mic.play()?;
+
     eprintln!(
         "Mic: {} | {}Hz",
         device.name().unwrap_or_else(|_| "?".into()),
         sample_rate
     );
-    eprintln!("Hold {} to record. Ctrl+C to quit.\n", args.key);
+    eprintln!("Hold {} to dictate. Ctrl+C to quit.\n", args.key);
 
-    loop {
-        match key_rx.recv() {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => break,
-        }
+    let preroll_len = (sample_rate as f32 * PREROLL_SECS) as usize;
+    let mut preroll: VecDeque<f32> = VecDeque::with_capacity(preroll_len);
+    let mut session: Option<Session> = None;
 
-        let notif_id = show_notification();
-        eprintln!("[Recording…]");
-
-        let raw_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-        let stream = build_input_stream(
-            &device,
-            &stream_config,
-            sample_format,
-            Arc::clone(&raw_buf),
-            channels,
-        )?;
-        stream.play()?;
-
-        loop {
-            match key_rx.recv() {
-                Ok(false) => break,
-                Ok(true) | Err(_) => {}
-            }
-        }
-
-        drop(stream);
-        dismiss_notification(notif_id);
-
-        let raw = raw_buf.lock().unwrap().clone();
-        if raw.is_empty() {
-            continue;
-        }
-        // Skip too-short samples
-        let duration = raw.len() as f32 / sample_rate as f32;
-        if duration < 0.5 {
-            eprintln!("[Audio too short! {:.1}s]", duration);
-            continue;
-        }
-
-        eprintln!("[Transcribing {:.1}s]", duration);
-        let audio = if sample_rate != SAMPLE_RATE {
-            resample(&raw, sample_rate, SAMPLE_RATE)?
-        } else {
-            raw
-        };
-
-        match transcribe(&recognizer, &audio) {
-            Ok(text) if !text.is_empty() => {
-                if let Err(e) = std::process::Command::new("wtype").arg(&text).status() {
-                    eprintln!("wtype failed: {e}");
+    for event in rx {
+        match event {
+            Event::Audio(chunk) => match &mut session {
+                Some(s) => {
+                    s.stream.accept_waveform(sample_rate as i32, &chunk);
+                    decode_ready(&recognizer, &s.stream);
+                    let text = current_text(&recognizer, &s.stream);
+                    // Hold back the last word, it may still change.
+                    let settled = text.rfind(' ').map_or("", |i| &text[..i]);
+                    type_diff(&mut s.typed, settled);
                 }
-                eprintln!("[Done: {text}]");
+                None => {
+                    preroll.extend(chunk);
+                    let excess = preroll.len().saturating_sub(preroll_len);
+                    preroll.drain(..excess);
+                }
+            },
+            Event::Key(true) if session.is_none() => {
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(sample_rate as i32, preroll.make_contiguous());
+                preroll.clear();
+                session = Some(Session {
+                    stream,
+                    typed: String::new(),
+                    notif: show_notification(),
+                });
             }
-            Ok(_) => eprintln!("[No speech detected]"),
-            Err(e) => eprintln!("[Error: {e}]"),
+            Event::Key(false) => {
+                let Some(mut s) = session.take() else { continue };
+                dismiss_notification(s.notif);
+                let tail = vec![0.0f32; (sample_rate as f32 * TAIL_PADDING_SECS) as usize];
+                s.stream.accept_waveform(sample_rate as i32, &tail);
+                s.stream.input_finished();
+                decode_ready(&recognizer, &s.stream);
+                let text = current_text(&recognizer, &s.stream);
+                type_diff(&mut s.typed, &text);
+                if text.is_empty() {
+                    eprintln!("[No speech detected]");
+                } else {
+                    eprintln!("[Done: {text}]");
+                }
+            }
+            Event::Key(true) => {}
         }
     }
 
     Ok(())
+}
+
+enum Event {
+    Key(bool),
+    Audio(Vec<f32>),
+}
+
+struct Session {
+    stream: OnlineStream,
+    /// Text already typed into the focused window
+    typed: String,
+    notif: Option<u32>,
+}
+
+fn decode_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) {
+    while recognizer.is_ready(stream) {
+        recognizer.decode(stream);
+    }
+}
+
+fn current_text(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> String {
+    recognizer
+        .get_result(stream)
+        .map(|r| r.text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Bring the typed text in line with `target`, backspacing over anything the model revised.
+fn type_diff(typed: &mut String, target: &str) {
+    let common = typed
+        .chars()
+        .zip(target.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let backspaces = typed.chars().count() - common;
+    let addition: String = target.chars().skip(common).collect();
+    if backspaces == 0 && addition.is_empty() {
+        return;
+    }
+    let mut cmd = std::process::Command::new("wtype");
+    for _ in 0..backspaces {
+        cmd.args(["-k", "BackSpace"]);
+    }
+    if !addition.is_empty() {
+        cmd.arg(&addition);
+    }
+    match cmd.status() {
+        Ok(_) => *typed = target.to_string(),
+        Err(e) => eprintln!("wtype failed: {e}"),
+    }
 }
 
 fn find_keyboards(trigger: Key) -> Vec<Device> {
@@ -201,22 +246,22 @@ fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     format: cpal::SampleFormat,
-    samples: Arc<Mutex<Vec<f32>>>,
+    tx: mpsc::Sender<Event>,
     channels: usize,
 ) -> Result<cpal::Stream> {
     let err_fn = |e| eprintln!("Audio error: {e}");
     macro_rules! stream_for {
         ($t:ty, $to_f32:expr) => {{
-            let s = samples.clone();
             device.build_input_stream(
                 config,
                 move |data: &[$t], _| {
-                    let mut buf = s.lock().unwrap();
-                    for frame in data.chunks(channels) {
-                        buf.push(
-                            frame.iter().map(|&x| ($to_f32)(x)).sum::<f32>() / channels as f32,
-                        );
-                    }
+                    let mono = data
+                        .chunks(channels)
+                        .map(|frame| {
+                            frame.iter().map(|&x| ($to_f32)(x)).sum::<f32>() / channels as f32
+                        })
+                        .collect();
+                    let _ = tx.send(Event::Audio(mono));
                 },
                 err_fn,
                 None,
@@ -233,36 +278,17 @@ fn build_input_stream(
     })
 }
 
-fn resample(input: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>> {
-    use rubato::{FftFixedIn, Resampler};
-    const CHUNK: usize = 1024;
-    let mut r = FftFixedIn::<f32>::new(from_hz as usize, to_hz as usize, CHUNK, 2, 1)
-        .map_err(|e| anyhow!("{e:?}"))?;
-    let mut out =
-        Vec::with_capacity((input.len() as f64 * to_hz as f64 / from_hz as f64) as usize + CHUNK);
-    let mut pos = 0;
-    while pos < input.len() {
-        let end = (pos + CHUNK).min(input.len());
-        let mut buf = vec![0.0f32; CHUNK];
-        buf[..end - pos].copy_from_slice(&input[pos..end]);
-        out.extend_from_slice(&r.process(&[buf], None).map_err(|e| anyhow!("{e:?}"))?[0]);
-        pos += CHUNK;
-    }
-    Ok(out)
-}
-
-fn load_model(dir: &Path, threads: i32) -> Result<OfflineRecognizer> {
-    let mut config = OfflineRecognizerConfig::default();
+fn load_model(dir: &Path, threads: i32) -> Result<OnlineRecognizer> {
+    let mut config = OnlineRecognizerConfig::default();
     let model = &mut config.model_config;
     model.transducer.encoder = Some(find_file(dir, "encoder", ".onnx")?);
     model.transducer.decoder = Some(find_file(dir, "decoder", ".onnx")?);
     model.transducer.joiner = Some(find_file(dir, "joiner", ".onnx")?);
     model.tokens = Some(find_file(dir, "tokens", ".txt")?);
-    model.model_type = Some("nemo_transducer".into());
     model.num_threads = threads;
     model.provider = Some("cpu".into());
     config.decoding_method = Some("greedy_search".into());
-    OfflineRecognizer::create(&config).context("Failed to load model")
+    OnlineRecognizer::create(&config).context("Failed to load model")
 }
 
 /// Find a file in `dir` named `<prefix>*<suffix>`, e.g. `encoder.int8.onnx`.
@@ -285,12 +311,4 @@ fn find_file(dir: &Path, prefix: &str, suffix: &str) -> Result<String> {
             dir.display()
         )),
     }
-}
-
-fn transcribe(recognizer: &OfflineRecognizer, audio: &[f32]) -> Result<String> {
-    let stream = recognizer.create_stream();
-    stream.accept_waveform(SAMPLE_RATE as i32, audio);
-    recognizer.decode(&stream);
-    let result = stream.get_result().context("Inference failed")?;
-    Ok(result.text.trim().to_string())
 }
